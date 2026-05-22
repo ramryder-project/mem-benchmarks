@@ -20,6 +20,7 @@ typedef enum {
     ACTION_UNSET = 0,
     ACTION_MAX_BW,
     ACTION_LATENCY_SWEEP,
+    ACTION_DYNAMIC_BW,
 } action_t;
 
 typedef struct __attribute__((aligned(64))) {
@@ -35,6 +36,10 @@ typedef struct __attribute__((aligned(64))) {
     size_t probe_buffer_bytes;
     int *sweep_pcts;
     int num_sweep_pcts;
+    int burst_period_ms;
+    int burst_duty_percent;
+    int base_load_percent;
+    int peak_load_percent;
 } config_t;
 
 typedef struct {
@@ -49,6 +54,9 @@ typedef struct {
     atomic_int *ready_count;
     atomic_bool *start_flag;
     atomic_bool *stop_flag;
+    atomic_int *active_workers;
+    atomic_uint *phase_id;
+    int num_workers;
 } worker_ctx_t;
 
 static const char *action_name(action_t action) {
@@ -57,6 +65,8 @@ static const char *action_name(action_t action) {
             return "max-bw";
         case ACTION_LATENCY_SWEEP:
             return "latency-sweep";
+        case ACTION_DYNAMIC_BW:
+            return "dynamic-bw";
         default:
             return "<action>";
     }
@@ -67,6 +77,7 @@ static void usage_general(const char *prog) {
             "Usage:\n"
             "  %s max-bw [options]\n"
             "  %s latency-sweep [options]\n"
+            "  %s dynamic-bw [options]\n"
             "\n"
             "Common options:\n"
             "  -c, --cores <list>         CPU core list, e.g. 0,2-4,7 (default: all available)\n"
@@ -83,8 +94,16 @@ static void usage_general(const char *prog) {
             "  -S, --sweep-seconds <sec>  Seconds per sweep point, default 2\n"
             "  -p, --probe-core <id>      Core used by latency probe (default: last selected core)\n"
             "  -m, --probe-mb <mb>        Probe working set size in MB, default 256\n"
-            "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n",
-            prog, prog);
+            "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n"
+            "\n"
+            "dynamic-bw options:\n"
+            "  -t, --time <sec>           Run time in seconds, default 10\n"
+            "  -i, --interval <sec>       Realtime print interval in seconds, default 1\n"
+            "  -y, --burst-period-ms <n>  Burst cycle period in ms, default 1000\n"
+            "  -d, --burst-duty <n>       Percent of each cycle spent at peak load, default 20\n"
+            "  -l, --base-load <n>        Base load percent, default 20\n"
+            "  -H, --peak-load <n>        Peak load percent, default 100\n",
+            prog, prog, prog);
 }
 
 static void usage_action(const char *prog, action_t action) {
@@ -109,6 +128,16 @@ static void usage_action(const char *prog, action_t action) {
                 "  -p, --probe-core <id>      Core used by latency probe (default: last selected core)\n"
                 "  -m, --probe-mb <mb>        Probe working set size in MB, default 256\n"
                 "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n");
+    } else if (action == ACTION_DYNAMIC_BW) {
+        fprintf(stderr,
+                "\n"
+                "dynamic-bw options:\n"
+                "  -t, --time <sec>           Run time in seconds, default 10\n"
+                "  -i, --interval <sec>       Realtime print interval in seconds, default 1\n"
+                "  -y, --burst-period-ms <n>  Burst cycle period in ms, default 1000\n"
+                "  -d, --burst-duty <n>       Percent of each cycle spent at peak load, default 20\n"
+                "  -l, --base-load <n>        Base load percent, default 20\n"
+                "  -H, --peak-load <n>        Peak load percent, default 100\n");
     }
     fprintf(stderr,
             "\n"
@@ -122,6 +151,10 @@ static bool parse_action(const char *s, action_t *out_action) {
     }
     if (strcmp(s, "latency-sweep") == 0) {
         *out_action = ACTION_LATENCY_SWEEP;
+        return true;
+    }
+    if (strcmp(s, "dynamic-bw") == 0) {
+        *out_action = ACTION_DYNAMIC_BW;
         return true;
     }
     return false;
@@ -337,6 +370,25 @@ static void bind_core_or_die(int core) {
     }
 }
 
+static bool worker_is_active(const worker_ctx_t *ctx) {
+    if (!ctx->active_workers || !ctx->phase_id || ctx->num_workers <= 0) {
+        return true;
+    }
+
+    unsigned int phase = atomic_load_explicit(ctx->phase_id, memory_order_relaxed);
+    int active = atomic_load_explicit(ctx->active_workers, memory_order_relaxed);
+    if (active <= 0) {
+        return false;
+    }
+    if (active >= ctx->num_workers) {
+        return true;
+    }
+
+    unsigned int phase_shift = phase % (unsigned int)ctx->num_workers;
+    int rotated_tid = (ctx->tid + (int)phase_shift) % ctx->num_workers;
+    return rotated_tid < active;
+}
+
 static void *worker_main(void *arg) {
     worker_ctx_t *ctx = (worker_ctx_t *)arg;
     bind_core_or_die(ctx->core_id);
@@ -363,6 +415,10 @@ static void *worker_main(void *arg) {
     }
 
     while (!atomic_load_explicit(ctx->stop_flag, memory_order_relaxed)) {
+        if (!worker_is_active(ctx)) {
+            sched_yield();
+            continue;
+        }
         if (ctx->read_percent == 100) {
             for (size_t n = 0; n < batch_lines; n++) {
                 if (ctx->random_access) {
@@ -562,6 +618,9 @@ static int run_bw_latency_point(const config_t *cfg, const int *bg_cores, int bg
         ctxs[i].ready_count = &ready_count;
         ctxs[i].start_flag = &start_flag;
         ctxs[i].stop_flag = &stop_flag;
+        ctxs[i].active_workers = NULL;
+        ctxs[i].phase_id = NULL;
+        ctxs[i].num_workers = bg_ncores;
 
         if (pthread_create(&threads[i], NULL, worker_main, &ctxs[i]) != 0) {
             atomic_store(&stop_flag, true);
@@ -603,6 +662,39 @@ static int run_bw_latency_point(const config_t *cfg, const int *bg_cores, int bg
     return (lat_ns < 0.0) ? -1 : 0;
 }
 
+static int clamp_pct_to_threads(int pct, int ncores) {
+    if (pct <= 0) {
+        return 0;
+    }
+    if (pct >= 100) {
+        return ncores;
+    }
+
+    int active = (pct * ncores + 99) / 100;
+    if (active < 1) {
+        active = 1;
+    }
+    if (active > ncores) {
+        active = ncores;
+    }
+    return active;
+}
+
+static int dynamic_target_load_pct(const config_t *cfg, uint64_t elapsed_ns) {
+    uint64_t period_ns = (uint64_t)cfg->burst_period_ms * 1000000ULL;
+    uint64_t cycle_ns = elapsed_ns % period_ns;
+    uint64_t peak_ns = (period_ns * (uint64_t)cfg->burst_duty_percent) / 100ULL;
+    return cycle_ns < peak_ns ? cfg->peak_load_percent : cfg->base_load_percent;
+}
+
+static unsigned int dynamic_phase_epoch(const config_t *cfg, uint64_t elapsed_ns) {
+    uint64_t period_ns = (uint64_t)cfg->burst_period_ms * 1000000ULL;
+    uint64_t cycle_ns = elapsed_ns % period_ns;
+    uint64_t peak_ns = (period_ns * (uint64_t)cfg->burst_duty_percent) / 100ULL;
+    uint64_t cycle_id = elapsed_ns / period_ns;
+    return (unsigned int)(cycle_id * 2ULL + (cycle_ns >= peak_ns ? 1ULL : 0ULL));
+}
+
 int main(int argc, char **argv) {
     int default_sweep_pcts[] = {0, 25, 50, 75, 90, 100};
     config_t cfg = {
@@ -618,6 +710,10 @@ int main(int argc, char **argv) {
         .probe_buffer_bytes = 256UL * 1024UL * 1024UL,
         .sweep_pcts = NULL,
         .num_sweep_pcts = 0,
+        .burst_period_ms = 1000,
+        .burst_duty_percent = 20,
+        .base_load_percent = 20,
+        .peak_load_percent = 100,
     };
     action_t action = ACTION_UNSET;
     int parse_argc = argc;
@@ -634,6 +730,10 @@ int main(int argc, char **argv) {
         {"probe-core", required_argument, NULL, 'p'},
         {"probe-mb", required_argument, NULL, 'm'},
         {"sweep-pcts", required_argument, NULL, 'P'},
+        {"burst-period-ms", required_argument, NULL, 'y'},
+        {"burst-duty", required_argument, NULL, 'd'},
+        {"base-load", required_argument, NULL, 'l'},
+        {"peak-load", required_argument, NULL, 'H'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -663,10 +763,14 @@ int main(int argc, char **argv) {
     bool saw_probe_core = false;
     bool saw_probe_mb = false;
     bool saw_sweep_pcts = false;
+    bool saw_burst_period = false;
+    bool saw_burst_duty = false;
+    bool saw_base_load = false;
+    bool saw_peak_load = false;
 
     optind = 1;
     int opt = 0;
-    while ((opt = getopt_long(parse_argc, parse_argv, "c:r:t:i:b:a:S:p:m:P:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(parse_argc, parse_argv, "c:r:t:i:b:a:S:p:m:P:y:d:l:H:h", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 free(cfg.cores);
@@ -761,6 +865,46 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 break;
+            case 'y': {
+                saw_burst_period = true;
+                int v = parse_nonneg_int(optarg, "burst period ms");
+                if (v <= 0) {
+                    fprintf(stderr, "--burst-period-ms/-y must be > 0\n");
+                    return 1;
+                }
+                cfg.burst_period_ms = v;
+                break;
+            }
+            case 'd': {
+                saw_burst_duty = true;
+                int v = parse_nonneg_int(optarg, "burst duty");
+                if (v < 0 || v > 100) {
+                    fprintf(stderr, "--burst-duty/-d must be in [0,100]\n");
+                    return 1;
+                }
+                cfg.burst_duty_percent = v;
+                break;
+            }
+            case 'l': {
+                saw_base_load = true;
+                int v = parse_nonneg_int(optarg, "base load");
+                if (v < 0 || v > 100) {
+                    fprintf(stderr, "--base-load/-l must be in [0,100]\n");
+                    return 1;
+                }
+                cfg.base_load_percent = v;
+                break;
+            }
+            case 'H': {
+                saw_peak_load = true;
+                int v = parse_nonneg_int(optarg, "peak load");
+                if (v < 0 || v > 100) {
+                    fprintf(stderr, "--peak-load/-H must be in [0,100]\n");
+                    return 1;
+                }
+                cfg.peak_load_percent = v;
+                break;
+            }
             case 'h':
                 usage_action(argv[0], action);
                 return 0;
@@ -776,13 +920,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (action == ACTION_MAX_BW && (saw_sweep_seconds || saw_probe_core || saw_probe_mb || saw_sweep_pcts)) {
-        fprintf(stderr, "Action `max-bw` does not accept latency-sweep-only options\n");
+    if (action == ACTION_MAX_BW &&
+        (saw_sweep_seconds || saw_probe_core || saw_probe_mb || saw_sweep_pcts ||
+         saw_burst_period || saw_burst_duty || saw_base_load || saw_peak_load)) {
+        fprintf(stderr, "Action `max-bw` does not accept non-max-bw options\n");
         usage_action(argv[0], action);
         return 1;
     }
-    if (action == ACTION_LATENCY_SWEEP && (saw_time || saw_interval)) {
-        fprintf(stderr, "Action `latency-sweep` does not accept max-bw-only options\n");
+    if (action == ACTION_LATENCY_SWEEP &&
+        (saw_time || saw_interval || saw_burst_period || saw_burst_duty || saw_base_load || saw_peak_load)) {
+        fprintf(stderr, "Action `latency-sweep` does not accept non-latency-sweep options\n");
+        usage_action(argv[0], action);
+        return 1;
+    }
+    if (action == ACTION_DYNAMIC_BW && (saw_sweep_seconds || saw_probe_core || saw_probe_mb || saw_sweep_pcts)) {
+        fprintf(stderr, "Action `dynamic-bw` does not accept latency-sweep-only options\n");
         usage_action(argv[0], action);
         return 1;
     }
@@ -792,6 +944,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to detect available CPU cores\n");
             return 1;
         }
+    }
+
+    if (action == ACTION_DYNAMIC_BW && cfg.base_load_percent > cfg.peak_load_percent) {
+        fprintf(stderr, "--base-load/-l must be <= --peak-load/-H\n");
+        free(cfg.cores);
+        free(cfg.sweep_pcts);
+        return 1;
     }
 
     if (action == ACTION_LATENCY_SWEEP) {
@@ -902,9 +1061,13 @@ int main(int argc, char **argv) {
     atomic_bool start_flag;
     atomic_bool stop_flag;
     atomic_int ready_count;
+    atomic_int active_workers;
+    atomic_uint phase_id;
     atomic_init(&start_flag, false);
     atomic_init(&stop_flag, false);
     atomic_init(&ready_count, 0);
+    atomic_init(&active_workers, cfg.num_cores);
+    atomic_init(&phase_id, 0U);
 
     size_t region_u64 = per_thread_u64;
 
@@ -920,6 +1083,9 @@ int main(int argc, char **argv) {
         ctxs[i].ready_count = &ready_count;
         ctxs[i].start_flag = &start_flag;
         ctxs[i].stop_flag = &stop_flag;
+        ctxs[i].active_workers = (action == ACTION_DYNAMIC_BW) ? &active_workers : NULL;
+        ctxs[i].phase_id = (action == ACTION_DYNAMIC_BW) ? &phase_id : NULL;
+        ctxs[i].num_workers = cfg.num_cores;
 
         if (pthread_create(&threads[i], NULL, worker_main, &ctxs[i]) != 0) {
             fprintf(stderr, "Failed to create thread %d\n", i);
@@ -935,17 +1101,31 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("=== mem_perf bandwidth test ===\n");
+    if (action == ACTION_DYNAMIC_BW) {
+        int initial_pct = dynamic_target_load_pct(&cfg, 0);
+        atomic_store_explicit(&active_workers, clamp_pct_to_threads(initial_pct, cfg.num_cores), memory_order_relaxed);
+        printf("=== mem_perf dynamic bandwidth test ===\n");
+    } else {
+        printf("=== mem_perf bandwidth test ===\n");
+    }
     printf("cores=");
     for (int i = 0; i < cfg.num_cores; i++) {
         printf("%d%s", cfg.cores[i], (i == cfg.num_cores - 1) ? "" : ",");
     }
-    printf(" | read:write=%d:%d | access=%s | duration=%ds | interval=%ds | per_thread_buffer=%zuMB | total_buffer=%zuMB\n",
+    printf(" | read:write=%d:%d | access=%s | duration=%ds | interval=%ds | per_thread_buffer=%zuMB | total_buffer=%zuMB",
            cfg.read_percent, 100 - cfg.read_percent, cfg.random_access ? "random" : "seq",
            cfg.duration_sec, cfg.interval_sec,
            cfg.per_thread_buffer_bytes / (1024UL * 1024UL),
            (cfg.per_thread_buffer_bytes * (size_t)cfg.num_cores) / (1024UL * 1024UL));
-    printf("time_s,inst_bw_GBps,total_bytes_GB\n");
+    if (action == ACTION_DYNAMIC_BW) {
+        printf(" | base_load=%d%% | peak_load=%d%% | burst_period=%dms | burst_duty=%d%%\n",
+               cfg.base_load_percent, cfg.peak_load_percent,
+               cfg.burst_period_ms, cfg.burst_duty_percent);
+        printf("time_s,avg_target_load_pct,avg_active_threads,inst_bw_GBps,total_bytes_GB\n");
+    } else {
+        printf("\n");
+        printf("time_s,inst_bw_GBps,total_bytes_GB\n");
+    }
     fflush(stdout);
 
     while (atomic_load_explicit(&ready_count, memory_order_acquire) < cfg.num_cores) {
@@ -956,12 +1136,42 @@ int main(int argc, char **argv) {
 
     uint64_t start_ns = now_ns();
     uint64_t last_ns = start_ns;
+    uint64_t next_report_ns = start_ns + (uint64_t)cfg.interval_sec * 1000000000ULL;
     uint64_t last_bytes = 0ULL;
     uint64_t total_bytes = 0ULL;
+    unsigned int last_phase_epoch = UINT32_MAX;
+    uint64_t last_dynamic_ns = start_ns;
+    uint64_t interval_target_pct_ns = 0ULL;
+    uint64_t interval_active_threads_ns = 0ULL;
+    int current_target_pct = (action == ACTION_DYNAMIC_BW) ? dynamic_target_load_pct(&cfg, 0) : 0;
+    int current_active_threads =
+        (action == ACTION_DYNAMIC_BW) ? clamp_pct_to_threads(current_target_pct, cfg.num_cores) : 0;
 
     while (true) {
-        sleep((unsigned int)cfg.interval_sec);
         uint64_t now = now_ns();
+        double elapsed = (double)(now - start_ns) / 1e9;
+        bool should_report = now >= next_report_ns || elapsed >= (double)cfg.duration_sec;
+
+        if (action == ACTION_DYNAMIC_BW) {
+            uint64_t elapsed_ns = now - start_ns;
+            uint64_t delta_ns = now - last_dynamic_ns;
+            interval_target_pct_ns += (uint64_t)current_target_pct * delta_ns;
+            interval_active_threads_ns += (uint64_t)current_active_threads * delta_ns;
+            last_dynamic_ns = now;
+            unsigned int phase_epoch = dynamic_phase_epoch(&cfg, elapsed_ns);
+            if (phase_epoch != last_phase_epoch) {
+                current_target_pct = dynamic_target_load_pct(&cfg, elapsed_ns);
+                current_active_threads = clamp_pct_to_threads(current_target_pct, cfg.num_cores);
+                atomic_store_explicit(&active_workers, current_active_threads, memory_order_relaxed);
+                atomic_store_explicit(&phase_id, phase_epoch, memory_order_relaxed);
+                last_phase_epoch = phase_epoch;
+            }
+        }
+
+        if (!should_report) {
+            usleep(1000);
+            continue;
+        }
 
         total_bytes = 0ULL;
         for (int i = 0; i < cfg.num_cores; i++) {
@@ -971,12 +1181,24 @@ int main(int argc, char **argv) {
         double dt = (double)(now - last_ns) / 1e9;
         uint64_t dbytes = total_bytes - last_bytes;
         double inst_gbps = dt > 0.0 ? ((double)dbytes / dt) / 1e9 : 0.0;
-        double elapsed = (double)(now - start_ns) / 1e9;
         double total_gb = (double)total_bytes / 1e9;
-        printf("%lld,%lld,%lld\n", round_to_ll(elapsed), round_to_ll(inst_gbps), round_to_ll(total_gb));
+        if (action == ACTION_DYNAMIC_BW) {
+            long long avg_target_pct = dt > 0.0 ? round_to_ll((double)interval_target_pct_ns / (double)(now - last_ns))
+                                                : 0;
+            long long avg_active_threads =
+                dt > 0.0 ? round_to_ll((double)interval_active_threads_ns / (double)(now - last_ns)) : 0;
+            printf("%lld,%d,%d,%lld,%lld\n",
+                   round_to_ll(elapsed), (int)avg_target_pct, (int)avg_active_threads,
+                   round_to_ll(inst_gbps), round_to_ll(total_gb));
+            interval_target_pct_ns = 0ULL;
+            interval_active_threads_ns = 0ULL;
+        } else {
+            printf("%lld,%lld,%lld\n", round_to_ll(elapsed), round_to_ll(inst_gbps), round_to_ll(total_gb));
+        }
         fflush(stdout);
 
         last_ns = now;
+        next_report_ns += (uint64_t)cfg.interval_sec * 1000000000ULL;
         last_bytes = total_bytes;
 
         if (elapsed >= (double)cfg.duration_sec) {
@@ -999,9 +1221,17 @@ int main(int argc, char **argv) {
     }
     double avg_gbps = ((double)total_bytes / total_sec) / 1e9;
 
-    printf("SUMMARY: duration=%llds total_bytes=%lldGB avg_bw=%lldGB/s checksum=%llu\n",
-           round_to_ll(total_sec), round_to_ll((double)total_bytes / 1e9),
-           round_to_ll(avg_gbps), (unsigned long long)checksum);
+    if (action == ACTION_DYNAMIC_BW) {
+        printf("SUMMARY: duration=%llds total_bytes=%lldGB avg_bw=%lldGB/s checksum=%llu base_load=%d peak_load=%d burst_period_ms=%d burst_duty=%d\n",
+               round_to_ll(total_sec), round_to_ll((double)total_bytes / 1e9),
+               round_to_ll(avg_gbps), (unsigned long long)checksum,
+               cfg.base_load_percent, cfg.peak_load_percent,
+               cfg.burst_period_ms, cfg.burst_duty_percent);
+    } else {
+        printf("SUMMARY: duration=%llds total_bytes=%lldGB avg_bw=%lldGB/s checksum=%llu\n",
+               round_to_ll(total_sec), round_to_ll((double)total_bytes / 1e9),
+               round_to_ll(avg_gbps), (unsigned long long)checksum);
+    }
 
     free(cfg.cores);
     free(cfg.sweep_pcts);

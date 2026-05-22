@@ -1,0 +1,1 @@
+./mem_perf dynamic-bw -t 1000 -a seq -r 100 -l 5 -H 100 -y 5000 -d 20
