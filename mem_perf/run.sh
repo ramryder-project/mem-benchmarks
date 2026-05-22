@@ -1,0 +1,1 @@
+./mem_perf max-bw -t 1000 -r 100 -a seq
