@@ -16,6 +16,12 @@
 #define CACHELINE_BYTES 64UL
 #define U64_PER_LINE (CACHELINE_BYTES / sizeof(uint64_t))
 
+typedef enum {
+    ACTION_UNSET = 0,
+    ACTION_MAX_BW,
+    ACTION_LATENCY_SWEEP,
+} action_t;
+
 typedef struct __attribute__((aligned(64))) {
     int *cores;
     int num_cores;
@@ -24,7 +30,6 @@ typedef struct __attribute__((aligned(64))) {
     int read_percent;
     size_t per_thread_buffer_bytes;
     bool random_access;
-    bool latency_sweep;
     int sweep_seconds;
     int probe_core;
     size_t probe_buffer_bytes;
@@ -46,23 +51,84 @@ typedef struct {
     atomic_bool *stop_flag;
 } worker_ctx_t;
 
-static void usage(const char *prog) {
+static const char *action_name(action_t action) {
+    switch (action) {
+        case ACTION_MAX_BW:
+            return "max-bw";
+        case ACTION_LATENCY_SWEEP:
+            return "latency-sweep";
+        default:
+            return "<action>";
+    }
+}
+
+static void usage_general(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [options]\n"
-            "Options:\n"
+            "Usage:\n"
+            "  %s max-bw [options]\n"
+            "  %s latency-sweep [options]\n"
+            "\n"
+            "Actions:\n"
+            "  max-bw               Run the standard bandwidth benchmark\n"
+            "  latency-sweep        Print latency vs bandwidth table (MLC-like)\n"
+            "\n"
+            "Common options:\n"
             "  -c, --cores <list>         CPU core list, e.g. 0,2-4,7 (default: all available)\n"
             "  -r, --read-percent <n>     Read ratio [0-100], default 50\n"
+            "  -b, --buffer-mb <mb>       Buffer size per worker in MB, default 100\n"
+            "  -a, --access <mode>        Access mode: random|seq, default random\n"
+            "  -h, --help                 Show this message\n"
+            "\n"
+            "max-bw options:\n"
             "  -t, --time <sec>           Run time in seconds, default 10\n"
             "  -i, --interval <sec>       Realtime print interval in seconds, default 1\n"
-            "  -b, --buffer-mb <mb>       Buffer size per thread in MB, default 100\n"
-            "  -a, --access <mode>        Access mode: random|seq, default random\n"
-            "  -L, --latency-sweep        Print latency vs bandwidth table (MLC-like)\n"
+            "\n"
+            "latency-sweep options:\n"
             "  -S, --sweep-seconds <sec>  Seconds per sweep point, default 2\n"
             "  -p, --probe-core <id>      Core used by latency probe (default: last selected core)\n"
             "  -m, --probe-mb <mb>        Probe working set size in MB, default 256\n"
-            "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n"
-            "  -h, --help                 Show this message\n",
-            prog);
+            "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n",
+            prog, prog);
+}
+
+static void usage_action(const char *prog, action_t action) {
+    fprintf(stderr, "Usage: %s %s [options]\n\n", prog, action_name(action));
+    fprintf(stderr,
+            "Common options:\n"
+            "  -c, --cores <list>         CPU core list, e.g. 0,2-4,7 (default: all available)\n"
+            "  -r, --read-percent <n>     Read ratio [0-100], default 50\n"
+            "  -b, --buffer-mb <mb>       Buffer size per worker in MB, default 100\n"
+            "  -a, --access <mode>        Access mode: random|seq, default random\n");
+    if (action == ACTION_MAX_BW) {
+        fprintf(stderr,
+                "\n"
+                "max-bw options:\n"
+                "  -t, --time <sec>           Run time in seconds, default 10\n"
+                "  -i, --interval <sec>       Realtime print interval in seconds, default 1\n");
+    } else if (action == ACTION_LATENCY_SWEEP) {
+        fprintf(stderr,
+                "\n"
+                "latency-sweep options:\n"
+                "  -S, --sweep-seconds <sec>  Seconds per sweep point, default 2\n"
+                "  -p, --probe-core <id>      Core used by latency probe (default: last selected core)\n"
+                "  -m, --probe-mb <mb>        Probe working set size in MB, default 256\n"
+                "  -P, --sweep-pcts <list>    Load points in percent, default 0,25,50,75,90,100\n");
+    }
+    fprintf(stderr,
+            "\n"
+            "  -h, --help                 Show this message\n");
+}
+
+static bool parse_action(const char *s, action_t *out_action) {
+    if (strcmp(s, "max-bw") == 0) {
+        *out_action = ACTION_MAX_BW;
+        return true;
+    }
+    if (strcmp(s, "latency-sweep") == 0) {
+        *out_action = ACTION_LATENCY_SWEEP;
+        return true;
+    }
+    return false;
 }
 
 static int parse_nonneg_int(const char *s, const char *name) {
@@ -551,13 +617,15 @@ int main(int argc, char **argv) {
         .read_percent = 50,
         .per_thread_buffer_bytes = 100UL * 1024UL * 1024UL,
         .random_access = true,
-        .latency_sweep = false,
         .sweep_seconds = 2,
         .probe_core = -1,
         .probe_buffer_bytes = 256UL * 1024UL * 1024UL,
         .sweep_pcts = NULL,
         .num_sweep_pcts = 0,
     };
+    action_t action = ACTION_UNSET;
+    int parse_argc = argc;
+    char **parse_argv = argv;
 
     static struct option long_opts[] = {
         {"cores", required_argument, NULL, 'c'},
@@ -566,7 +634,6 @@ int main(int argc, char **argv) {
         {"interval", required_argument, NULL, 'i'},
         {"buffer-mb", required_argument, NULL, 'b'},
         {"access", required_argument, NULL, 'a'},
-        {"latency-sweep", no_argument, NULL, 'L'},
         {"sweep-seconds", required_argument, NULL, 'S'},
         {"probe-core", required_argument, NULL, 'p'},
         {"probe-mb", required_argument, NULL, 'm'},
@@ -575,8 +642,35 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0},
     };
 
+    if (argc <= 1) {
+        usage_general(argv[0]);
+        return 1;
+    }
+
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        usage_general(argv[0]);
+        return 0;
+    }
+
+    if (parse_action(argv[1], &action)) {
+        parse_argc = argc - 1;
+        parse_argv = argv + 1;
+    } else {
+        fprintf(stderr, "Unknown action: %s\n", argv[1]);
+        usage_general(argv[0]);
+        return 1;
+    }
+
+    bool saw_time = false;
+    bool saw_interval = false;
+    bool saw_sweep_seconds = false;
+    bool saw_probe_core = false;
+    bool saw_probe_mb = false;
+    bool saw_sweep_pcts = false;
+
+    optind = 1;
     int opt = 0;
-    while ((opt = getopt_long(argc, argv, "c:r:t:i:b:a:LS:p:m:P:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(parse_argc, parse_argv, "c:r:t:i:b:a:S:p:m:P:h", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 free(cfg.cores);
@@ -597,6 +691,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case 't': {
+                saw_time = true;
                 int v = parse_nonneg_int(optarg, "time");
                 if (v <= 0) {
                     fprintf(stderr, "--time/-t must be > 0\n");
@@ -606,6 +701,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case 'i': {
+                saw_interval = true;
                 int v = parse_nonneg_int(optarg, "interval");
                 if (v <= 0) {
                     fprintf(stderr, "--interval/-i must be > 0\n");
@@ -629,10 +725,8 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 break;
-            case 'L':
-                cfg.latency_sweep = true;
-                break;
             case 'S': {
+                saw_sweep_seconds = true;
                 int v = parse_nonneg_int(optarg, "sweep seconds");
                 if (v <= 0) {
                     fprintf(stderr, "--sweep-seconds/-S must be > 0\n");
@@ -642,6 +736,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case 'p': {
+                saw_probe_core = true;
                 int v = parse_nonneg_int(optarg, "probe core");
                 if (v < 0) {
                     fprintf(stderr, "--probe-core/-p must be >= 0\n");
@@ -651,6 +746,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case 'm': {
+                saw_probe_mb = true;
                 int v = parse_nonneg_int(optarg, "probe MB");
                 if (v <= 0) {
                     fprintf(stderr, "--probe-mb/-m must be > 0\n");
@@ -660,6 +756,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case 'P':
+                saw_sweep_pcts = true;
                 free(cfg.sweep_pcts);
                 cfg.sweep_pcts = NULL;
                 cfg.num_sweep_pcts = 0;
@@ -669,17 +766,28 @@ int main(int argc, char **argv) {
                 }
                 break;
             case 'h':
-                usage(argv[0]);
+                usage_action(argv[0], action);
                 return 0;
             default:
-                usage(argv[0]);
+                usage_action(argv[0], action);
                 return 1;
         }
     }
 
-    if (optind < argc) {
-        fprintf(stderr, "Unexpected positional argument: %s\n", argv[optind]);
-        usage(argv[0]);
+    if (optind < parse_argc) {
+        fprintf(stderr, "Unexpected positional argument: %s\n", parse_argv[optind]);
+        usage_action(argv[0], action);
+        return 1;
+    }
+
+    if (action == ACTION_MAX_BW && (saw_sweep_seconds || saw_probe_core || saw_probe_mb || saw_sweep_pcts)) {
+        fprintf(stderr, "Action `max-bw` does not accept latency-sweep-only options\n");
+        usage_action(argv[0], action);
+        return 1;
+    }
+    if (action == ACTION_LATENCY_SWEEP && (saw_time || saw_interval)) {
+        fprintf(stderr, "Action `latency-sweep` does not accept max-bw-only options\n");
+        usage_action(argv[0], action);
         return 1;
     }
 
@@ -690,7 +798,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (cfg.latency_sweep) {
+    if (action == ACTION_LATENCY_SWEEP) {
         if (cfg.num_sweep_pcts == 0) {
             cfg.num_sweep_pcts = (int)(sizeof(default_sweep_pcts) / sizeof(default_sweep_pcts[0]));
             cfg.sweep_pcts = (int *)malloc((size_t)cfg.num_sweep_pcts * sizeof(int));
